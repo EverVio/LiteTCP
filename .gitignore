@@ -1,0 +1,29 @@
+# CMake build outputs
+/build/
+
+# Project output binaries and libraries
+/bin/
+/lib/
+
+# Test outputs and log results
+/test_results/
+
+# Compiled libraries and object files
+*.a
+*.lib
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
