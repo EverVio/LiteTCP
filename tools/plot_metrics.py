@@ -128,8 +128,8 @@ def plot_advanced_metrics():
     ax1.grid(True, linestyle=":", alpha=0.6)
     ax1.legend(loc="upper right", frameon=True, facecolor="white", edgecolor="none")
 
-    # 局部微观放大视图，聚焦前 3 秒以清晰展示慢启动的指数增长和拥塞避免的线性增长锯齿波形。
-    zoom_limit = 3.0
+    # 局部微观放大视图，聚焦前 2 秒以清晰展示慢启动的指数增长和拥塞避免的线性增长锯齿波形。
+    zoom_limit = 2.0
     zoom_indices = [i for i, t in enumerate(timestamps) if t <= zoom_limit]
 
     if zoom_indices:

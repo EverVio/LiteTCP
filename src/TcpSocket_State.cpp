@@ -139,7 +139,7 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 								   }),
 					sent_packets.end());
 
-				// 基于 TCP Reno 算法 of 拥塞控制更新逻辑，分慢启动、拥塞避免和快速恢复三种情况进行 cwnd 的增减。
+				// 基于 TCP Reno 算法的拥塞控制更新逻辑，分慢启动、拥塞避免和快速恢复三种情况进行 cwnd 的增减。
 				if (congestion_state == 0) {
 					cwnd += MSS;  // 慢启动：每收到 1 个新 ACK，拥塞窗口 cwnd 增加 1 MSS。
 					if (cwnd >= ssthresh) {
@@ -157,12 +157,15 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 						if (!sent_packets.empty()) {
 							retransmit_packet(sent_packets.front());
 						}
+
 						uint32_t confirmed_bytes = ack - last_ack_received;
-						if (cwnd > confirmed_bytes) {
-							cwnd = cwnd - confirmed_bytes + MSS;
-						} else {
-							cwnd = MSS;
+						cwnd = cwnd - confirmed_bytes + MSS;
+
+						// 避免大块确认使 cwnd 变为负数或极小值。
+						if (cwnd < ssthresh) {
+							cwnd = ssthresh;
 						}
+
 						congestion_state = 2;
 					}
 				}

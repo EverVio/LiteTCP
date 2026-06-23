@@ -31,7 +31,7 @@ TcpSocket::TcpSocket()
 	  rto_pending(false),
 	  active_event_id(0),
 	  recv_buf(MAX_RECV_BUF_SIZE) {
-	// 使用随机数发生器生成本端连接的初始序列号（ISN），并初始化发送窗口。
+	// 使用随机数作为本端连接的初始序列号（ISN），并初始化发送窗口。
 	std::random_device rd;
 	std::mt19937 gen(rd());
 	std::uniform_int_distribution<uint32_t> distr(1000, 1000000);
