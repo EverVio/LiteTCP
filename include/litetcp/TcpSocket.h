@@ -175,6 +175,7 @@ private:
 	double estimated_rtt;  // 平滑往返时间（秒）。
 	double dev_rtt;		   // 往返时间偏差均值（秒）。
 	double rto;			   // 当前超时重传阈值（秒）。
+	bool rto_pending;	   // RTO 超时重传且尚未收到新确认的挂起状态标志。
 
 	// 服务端监听套接字专用的半连接/全连接队列。
 	std::queue<TcpSocket*> completed_queue;	 // 已完成三次握手的子套接字指针队列。

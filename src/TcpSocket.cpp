@@ -12,15 +12,15 @@
 #include "TimerManager.h"
 
 // 设定接收缓冲区最大限制以及每个 TCP 报文段的 MSS 大小（排除 20 字节首部后为 1380 字节）。
-constexpr size_t MAX_RECV_BUF_SIZE = 5000 * 1400;
+constexpr size_t MAX_RECV_BUF_SIZE = 65536;
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 TcpSocket::TcpSocket()
 	: state(TcpState::CLOSED),
 	  rcv_nxt(0),
-	  peer_rwnd(32 * 1400),
-	  cwnd(1400.0),
-	  ssthresh(32 * 1400),
+	  peer_rwnd(32 * MSS),
+	  cwnd(static_cast<double>(MSS)),
+	  ssthresh(32 * MSS),
 	  dup_ack_count(0),
 	  congestion_state(0),	// 拥塞状态默认为 0（慢启动阶段）。
 	  recover(0),
@@ -28,6 +28,7 @@ TcpSocket::TcpSocket()
 	  estimated_rtt(0.1),
 	  dev_rtt(0.05),
 	  rto(0.2),
+	  rto_pending(false),
 	  active_event_id(0),
 	  recv_buf(MAX_RECV_BUF_SIZE) {
 	// 使用随机数发生器生成本端连接的初始序列号（ISN），并初始化发送窗口。

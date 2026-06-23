@@ -80,11 +80,12 @@ void NetworkEngine::shutdown() {
 		sendto(backend_udp_fd, &dummy, 1, 0, reinterpret_cast<struct sockaddr*>(&self_addr), sizeof(self_addr));
 	}
 
-	// 等待接收线程安全退出并关闭底层套接字。
+	// 等待接收线程安全退出。
 	if (recv_thread.joinable()) {
 		recv_thread.join();
 	}
 
+	// 关闭底层套接字。
 	if (backend_udp_fd != -1) {
 		close(backend_udp_fd);
 		backend_udp_fd = -1;

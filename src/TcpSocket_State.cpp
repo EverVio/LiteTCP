@@ -8,7 +8,7 @@
 
 #include "NetworkEngine.h"
 
-constexpr size_t MAX_RECV_BUF_SIZE = 5000 * 1400;
+constexpr size_t MAX_RECV_BUF_SIZE = 65536;
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 void TcpSocket::handle_packet(const TcpPacket& packet) {
@@ -90,20 +90,37 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 		state == TcpState::CLOSING || state == TcpState::LAST_ACK) {
 		// === 步骤 A: 处理 ACK 确认以驱动发送窗口滑动与拥塞窗口更新 ===
 		if (flags & TCP_FLAG_ACK) {
+			uint32_t old_rwnd = peer_rwnd;
 			peer_rwnd = packet.header.advertised_window;
+			if (peer_rwnd > 0 && old_rwnd == 0) {
+				send_cv.notify_all();
+			}
 
 			if (ack > snd_una) {
 				// 收到新的确认号，更新发送窗口左边缘。
 				snd_una = ack;
+				rto_pending = false;
 
 				// 计算精确往返时间（RTT）与超时阈值（RTO），根据 Karn 算法排除包含重传的报文。
 				auto now = std::chrono::steady_clock::now();
 				double sample_rtt = -1.0;
+				bool has_retransmitted = false;
 				for (const auto& p : sent_packets) {
-					if (p.seq + p.len <= ack && p.retransmit_count == 0) {
-						auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - p.send_time).count();
-						sample_rtt = duration / 1000000.0;
-						break;
+					if (p.seq + p.len <= ack) {
+						if (p.retransmit_count > 0) {
+							has_retransmitted = true;
+							break;
+						}
+					}
+				}
+
+				if (!has_retransmitted) {
+					for (const auto& p : sent_packets) {
+						if (p.seq + p.len <= ack) {
+							auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - p.send_time).count();
+							sample_rtt = duration / 1000000.0;
+							break;
+						}
 					}
 				}
 
@@ -124,12 +141,12 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 
 				// 基于 TCP Reno 算法 of 拥塞控制更新逻辑，分慢启动、拥塞避免和快速恢复三种情况进行 cwnd 的增减。
 				if (congestion_state == 0) {
-					cwnd += 1400.0;	 // 慢启动：每收到 1 个新 ACK，拥塞窗口 cwnd 增加 1 MSS。
+					cwnd += MSS;  // 慢启动：每收到 1 个新 ACK，拥塞窗口 cwnd 增加 1 MSS。
 					if (cwnd >= ssthresh) {
 						congestion_state = 1;
 					}
 				} else if (congestion_state == 1) {
-					cwnd += (1400.0 * 1400.0) / cwnd;  // 拥塞避免：每个 RTT 周期内，cwnd 大约增加 1 MSS。
+					cwnd += (static_cast<double>(MSS) * MSS) / cwnd;  // 拥塞避免：每个 RTT 周期内，cwnd 大约增加 1 MSS。
 				} else if (congestion_state == 2) {
 					if (ack >= recover) {
 						// 收到完全确认（Full ACK），退出快速恢复阶段，回到拥塞避免。
@@ -141,8 +158,10 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 							retransmit_packet(sent_packets.front());
 						}
 						uint32_t confirmed_bytes = ack - last_ack_received;
-						if (confirmed_bytes > MSS) {
-							cwnd -= MSS;
+						if (cwnd > confirmed_bytes) {
+							cwnd = cwnd - confirmed_bytes + MSS;
+						} else {
+							cwnd = MSS;
 						}
 						congestion_state = 2;
 					}
@@ -157,24 +176,29 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 				write_log("ack_received");
 			} else if (ack == snd_una) {
 				// 收到重复的确认号，仅在有未确认数据且该包是无载荷纯控制包时进行冗余 ACK 计数。
-				if (!sent_packets.empty() && payload_len == 0) {
+				if (!sent_packets.empty() && payload_len == 0 && !rto_pending) {
 					dup_ack_count++;
 					write_log("dup_ack");
 
 					// 触发快速重传与快速恢复。
-					if (dup_ack_count == 3) {
-						congestion_state = 2;
-						recover = snd_nxt;	// 记录进入快速恢复时的边界序列号。
-						ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
-						cwnd = ssthresh + 3 * MSS;
-
-						if (!sent_packets.empty()) {
-							retransmit_packet(sent_packets.front());
-						}
-						write_log("fast_retransmit");
-					} else if (dup_ack_count > 3) {
-						cwnd += 1400.0;	 // 快速恢复阶段继续收到重复 ACK，临时膨胀 cwnd 并尝试发送新数据。
+					if (congestion_state == 2) {
+						cwnd += MSS;  // 快速恢复阶段继续收到重复 ACK，临时膨胀 cwnd 并尝试发送新数据。
 						send_cv.notify_all();
+					} else {
+						if (dup_ack_count == 3) {
+							congestion_state = 2;
+							recover = snd_nxt;	// 记录进入快速恢复时的边界序列号。
+							ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
+							cwnd = ssthresh + 3 * MSS;
+
+							if (!sent_packets.empty()) {
+								retransmit_packet(sent_packets.front());
+							}
+							write_log("fast_retransmit");
+						} else if (dup_ack_count > 3) {
+							cwnd += MSS;  // 快速恢复阶段继续收到重复 ACK，临时膨胀 cwnd 并尝试发送新数据。
+							send_cv.notify_all();
+						}
 					}
 				}
 			}

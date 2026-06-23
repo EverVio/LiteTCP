@@ -57,7 +57,7 @@ inline std::string state_to_string(TcpState state) {
 }
 
 #pragma pack(push, 1)
-// 紧凑打包的 LiteTCP 报文头结构体，固定大小为 20 字节。
+// 紧密排列的 LiteTCP 报文头结构体，固定大小为 20 字节。
 struct TcpHeader {
 	uint16_t source_port;		 // 源端口号。
 	uint16_t destination_port;	 // 目的端口号。

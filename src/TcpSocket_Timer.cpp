@@ -7,7 +7,7 @@
 #include "NetworkEngine.h"
 #include "TimerManager.h"
 
-constexpr size_t MAX_RECV_BUF_SIZE = 5000 * 1400;
+constexpr size_t MAX_RECV_BUF_SIZE = 65536;
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 void TcpSocket::retransmit_packet(SentPacket& pkt) {
@@ -94,9 +94,10 @@ void TcpSocket::handle_timeout() {
 
 			rto = std::min(rto * 2.0, 5.0);
 			ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
-			cwnd = 1400.0;
+			cwnd = static_cast<double>(MSS);
 			congestion_state = 0;
 			dup_ack_count = 0;
+			rto_pending = true;
 
 			write_log("rto_timeout");
 		}
