@@ -213,7 +213,10 @@ int TcpSocket::send(const void* buffer, int len) {
 			if (peer_rwnd > 0 && curr_wnd < MSS) {
 				curr_wnd = MSS;
 			}
-			uint32_t allowed_to_send = curr_wnd - flight_size;
+			uint32_t allowed_to_send = 0;
+			if (curr_wnd > flight_size) {
+				allowed_to_send = curr_wnd - flight_size;
+			}
 
 			// 计算本次发送段的大小，受发送窗口配额、剩余长度与 MSS 三者限制。
 			int chunk_size = std::min({static_cast<int>(allowed_to_send), len - bytes_sent, static_cast<int>(MSS)});

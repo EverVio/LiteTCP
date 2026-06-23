@@ -93,7 +93,9 @@ void TcpSocket::handle_timeout() {
 			retransmit_packet(oldest);
 
 			rto = std::min(rto * 2.0, 5.0);
-			ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
+			if (!rto_pending) {
+				ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
+			}
 			cwnd = static_cast<double>(MSS);
 			congestion_state = 0;
 			dup_ack_count = 0;

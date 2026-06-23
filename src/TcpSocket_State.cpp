@@ -180,7 +180,7 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 				write_log("ack_received");
 			} else if (ack == snd_una) {
 				// 收到重复的确认号，仅在有未确认数据且该包是无载荷纯控制包时进行冗余 ACK 计数。
-				if (!sent_packets.empty() && payload_len == 0 && !rto_pending) {
+				if (!sent_packets.empty() && payload_len == 0 && !rto_pending && peer_rwnd == old_rwnd) {
 					dup_ack_count++;
 					write_log("dup_ack");
 
