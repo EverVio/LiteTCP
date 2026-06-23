@@ -29,6 +29,7 @@ TcpSocket::TcpSocket()
 	  dev_rtt(0.05),
 	  rto(0.2),
 	  rto_pending(false),
+	  rto_timer_start(std::chrono::steady_clock::now()),
 	  active_event_id(0),
 	  recv_buf(MAX_RECV_BUF_SIZE) {
 	// 使用随机数作为本端连接的初始序列号（ISN），并初始化发送窗口。
@@ -50,7 +51,6 @@ TcpSocket::TcpSocket()
 }
 
 TcpSocket::~TcpSocket() {
-	// 析构时优先解除在网络收发引擎中注册的路由，以切断任何可能到达本实例的收包回调路径。
 	if (state == TcpState::LISTEN) {
 		NetworkEngine::unregister_listen_socket(local_addr.port);
 	} else if (state != TcpState::CLOSED) {
@@ -234,6 +234,10 @@ int TcpSocket::send(const void* buffer, int len) {
 			sent_pkt.len = chunk_size;
 			sent_pkt.retransmit_count = 0;
 			sent_pkt.send_time = std::chrono::steady_clock::now();
+			
+			if (sent_packets.empty()) {
+				rto_timer_start = sent_pkt.send_time;
+			}
 			sent_packets.push_back(sent_pkt);
 
 			// 更新已发送的序列号前缘。

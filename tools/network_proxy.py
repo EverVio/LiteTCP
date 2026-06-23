@@ -67,6 +67,7 @@ def control_thread_func():
     # 监听 20217 控制端口，接收测试主控端下发的 DROP_SYN 握手丢包或 SET_DROP_RATE 弱网参数修改指令。
     global DROP_RATE, DELAY_MS, drop_next_syn
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    control_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     control_sock.bind(("127.0.0.1", CONTROL_PORT))
     print(f"[Proxy] Control channel listening on 127.0.0.1:{CONTROL_PORT}")
     while True:
@@ -94,6 +95,7 @@ def control_thread_func():
 def main():
     global drop_next_syn
     proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     proxy_sock.bind(("127.0.0.1", PROXY_PORT))
 
     send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

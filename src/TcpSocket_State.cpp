@@ -103,6 +103,7 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 
 				// 计算精确往返时间（RTT）与超时阈值（RTO），根据 Karn 算法排除包含重传的报文。
 				auto now = std::chrono::steady_clock::now();
+				rto_timer_start = now;
 				double sample_rtt = -1.0;
 				bool has_retransmitted = false;
 				for (const auto& p : sent_packets) {

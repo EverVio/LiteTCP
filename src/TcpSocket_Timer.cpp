@@ -39,7 +39,7 @@ void TcpSocket::update_timer_locked() {
 		if (!sent_packets.empty()) {
 			auto rto_duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 				std::chrono::duration<double>(rto));
-			auto rto_expire = sent_packets.front().send_time + rto_duration;
+			auto rto_expire = rto_timer_start + rto_duration;
 			if (rto_expire < min_expire) {
 				min_expire = rto_expire;
 			}
@@ -88,7 +88,7 @@ void TcpSocket::handle_timeout() {
 	// 2. 处理 RTO 超时重传。触发重传后，对重传间隔 RTO 执行指数退避（最大退避至 5 秒），同时将慢启动阈值减半并把拥塞窗口 cwnd 重置为 1 MSS 回退至慢启动状态。
 	if (!sent_packets.empty()) {
 		auto& oldest = sent_packets.front();
-		double elapsed = std::chrono::duration<double>(now - oldest.send_time).count();
+		double elapsed = std::chrono::duration<double>(now - rto_timer_start).count();
 		if (elapsed >= rto) {
 			retransmit_packet(oldest);
 
@@ -98,6 +98,7 @@ void TcpSocket::handle_timeout() {
 			congestion_state = 0;
 			dup_ack_count = 0;
 			rto_pending = true;
+			rto_timer_start = now;
 
 			write_log("rto_timeout");
 		}
