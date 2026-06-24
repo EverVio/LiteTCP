@@ -42,4 +42,5 @@ public:
 	// 注册和注销已建立连接的套接字路由。
 	static void register_established_socket(uint16_t local_port, uint16_t remote_port, TcpSocket* sock);
 	static void unregister_established_socket(uint16_t local_port, uint16_t remote_port);
+	static TcpSocket* get_established_socket();
 };

@@ -14,6 +14,8 @@ constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 void TcpSocket::handle_packet(const TcpPacket& packet) {
 	std::lock_guard<std::mutex> lock(socket_mutex);
 
+	TcpState old_state = state;
+
 	switch (state) {
 		case TcpState::LISTEN:
 		case TcpState::SYN_SENT:
@@ -32,6 +34,14 @@ void TcpSocket::handle_packet(const TcpPacket& packet) {
 			break;
 	}
 
+	// 在 SYN_RECV -> ESTABLISHED 状态迁移时，若收到带有数据载荷或 FIN 的包，
+	// 则直接交给 handle_established_or_close_packet 处理。
+	if (old_state == TcpState::SYN_RECV && state == TcpState::ESTABLISHED) {
+		size_t payload_len = packet.data.size();
+		if (payload_len > 0 || (packet.header.flags & TCP_FLAG_FIN))
+			handle_established_or_close_packet(packet);
+	}
+
 	update_timer_locked();
 }
 
@@ -40,19 +50,37 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 	uint32_t seq = packet.header.seq_num;
 	uint32_t ack = packet.header.ack_num;
 
-	// 1. LISTEN 状态处理。收到客户端 SYN 握手请求后，创建一个子套接字并初始化状态为 SYN_RECV，随后在网络引擎中建立四元组路由并发送 SYN+ACK。
+	// 1. LISTEN 状态处理。收到客户端 SYN 握手请求后，创建一个子套接字并初始化状态为 SYN_RECV，
+	// 并在网络引擎中建立四元组路由并发送 SYN+ACK。
 	if (state == TcpState::LISTEN) {
 		if ((flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
+			// 检查是否已经存在与当前 remote_port 匹配且处于握手状态的 child。
+			TcpSocket* existing = NetworkEngine::get_established_socket();
+			if (existing) {
+				if (existing->get_remote_addr().port == packet.header.source_port) {
+					// 收到重复的 SYN 包，直接重传 SYN+ACK
+					existing->send_control_packet(TCP_FLAG_SYN | TCP_FLAG_ACK);
+					return;
+				} else if (existing->get_state() == TcpState::SYN_RECV)
+					// 新的客户端发来 SYN，且之前的子套接字仍处于半连接状态（未完成握手），直接释放
+					delete existing;
+			}
+
 			TcpSocket* child = new TcpSocket();
+			// 继承父套接字信息
 			child->parent = this;
 			child->local_addr = this->local_addr;
 			child->remote_addr.ip = inet_addr("127.0.0.1");
 			child->remote_addr.port = packet.header.source_port;
+
+			// SYN 段占用一个序列号，期望收到的下一个字节序号是 seq+1
 			child->rcv_nxt = seq + 1;
+
 			std::random_device rd;
 			std::mt19937 gen(rd());
 			std::uniform_int_distribution<uint32_t> distr(1000, 1000000);
 			uint32_t isn = distr(gen);
+
 			child->snd_una = isn;
 			child->snd_nxt = isn;
 			child->last_ack_received = isn;
@@ -66,7 +94,8 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 		return;
 	}
 
-	// 2. SYN_SENT 状态处理。客户端收到服务端的 SYN+ACK 后，确认无误则清空重传包，更新发送窗口并将自身迁移至 ESTABLISHED 状态，随后发送 ACK 并唤醒 connect 等待线程。
+	// 2. SYN_SENT 状态处理。客户端收到服务端的 SYN+ACK 后，确认无误则清空重传包，
+	// 更新发送窗口并将自身迁移至 ESTABLISHED 状态，随后发送 ACK 并唤醒 connect 等待线程。
 	if (state == TcpState::SYN_SENT) {
 		if ((flags & (TCP_FLAG_SYN | TCP_FLAG_ACK)) == (TCP_FLAG_SYN | TCP_FLAG_ACK)) {
 			if (ack == snd_una + 1) {
@@ -83,10 +112,17 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 		return;
 	}
 
-	// 3. SYN_RECV 状态处理。服务端收到客户端对 SYN+ACK 的 ACK 确认包后，清空重传队列并将状态迁移至 ESTABLISHED，最后将子套接字推入监听套接字的全连接队列中并唤醒 accept 线程。
+	// 3. SYN_RECV 状态处理。服务端收到客户端对 SYN+ACK 的 ACK 确认包后，
+	// 清空重传队列并将状态迁移至 ESTABLISHED，最后将子套接字推入监听套接字的全连接队列中并唤醒 accept 线程。
 	if (state == TcpState::SYN_RECV) {
+		if ((flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
+			// 收到重复的 SYN 包，重传 SYN+ACK 响应以唤醒对端。
+			send_control_packet(TCP_FLAG_SYN | TCP_FLAG_ACK);
+			return;
+		}
 		if ((flags & TCP_FLAG_ACK) && !(flags & TCP_FLAG_SYN)) {
-			if (ack == snd_una + 1) {
+			// 校验第三次握手包的确认号与序列号
+			if (ack == snd_una + 1 && seq == rcv_nxt) {
 				sent_packets.clear();
 				snd_una = ack;
 				state = TcpState::ESTABLISHED;
@@ -99,7 +135,6 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 				}
 			}
 		}
-		return;
 	}
 }
 
@@ -213,6 +248,14 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 			close_cv.notify_all();
 			write_log("ack_received");
 		} else if (ack == snd_una) {
+			// 如果处于 ESTABLISHED 状态且收到了对端重传的 SYN+ACK，
+			// 说明对端没收到第三次握手的 ACK，必须立刻回传一个纯 ACK 以完成握手。
+			if ((state == TcpState::ESTABLISHED) && (flags & TCP_FLAG_SYN)) {
+				send_control_packet(TCP_FLAG_ACK);
+				write_log("ack_retransmit_for_syn_ack");
+				return;
+			}
+
 			// 收到重复的确认号，仅在有未确认数据且该包是无载荷纯控制包时进行冗余 ACK 计数。
 			if (!sent_packets.empty() && payload_len == 0 && !rto_pending && peer_rwnd == old_rwnd) {
 				dup_ack_count++;

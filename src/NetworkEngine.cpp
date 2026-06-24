@@ -133,8 +133,10 @@ void NetworkEngine::receive_loop() {
 			{
 				std::lock_guard<std::mutex> lock(socks_mutex);
 
-				// 优先在路由表中匹配已建立连接的套接字，其次匹配处于监听状态的套接字。
-				if (established_sock) {
+				// 优先在路由表中精确匹配已建立连接的套接字（校验本地与远端端口），其次匹配处于监听状态的套接字。
+				if (established_sock && 
+					established_sock->get_local_addr().port == local_tcp_port && 
+					established_sock->get_remote_addr().port == remote_tcp_port) {
 					target_sock = established_sock;
 				} else if (listen_sock) {
 					target_sock = listen_sock;
@@ -167,4 +169,9 @@ void NetworkEngine::register_established_socket(uint16_t local_port, uint16_t re
 void NetworkEngine::unregister_established_socket(uint16_t local_port, uint16_t remote_port) {
 	std::lock_guard<std::mutex> lock(socks_mutex);
 	established_sock = nullptr;
+}
+
+TcpSocket* NetworkEngine::get_established_socket() {
+	std::lock_guard<std::mutex> lock(socks_mutex);
+	return established_sock;
 }
