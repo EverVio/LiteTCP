@@ -152,6 +152,14 @@ private:
 	// 将新的乱序区间插入表并尝试与前后重叠区间合并。
 	void add_interval(uint32_t start, uint32_t end);
 
+	// 生命周期及数据处理辅助函数 (用于重构 handle_packet)
+	void handle_handshake_packet(const TcpPacket& packet);
+	void handle_established_or_close_packet(const TcpPacket& packet);
+	void process_ack(const TcpPacket& packet, size_t payload_len);
+	void process_payload(const TcpPacket& packet, size_t payload_len);
+	void process_fin(const TcpPacket& packet);
+	void process_state_cleanup(const TcpPacket& packet);
+
 	TcpState state;			   // TCP 当前所处的状态机状态。
 	LiteSockAddr local_addr;   // 本地绑定的网络地址端口。
 	LiteSockAddr remote_addr;  // 对端建立连接的远端网络地址端口。
@@ -169,14 +177,14 @@ private:
 	uint32_t last_ack_received;	 // 上一次收到的确认号。
 	int congestion_state;		 // 当前拥塞状态（0为慢启动，1为拥塞避免，2为快速恢复）。
 	uint32_t recover;			 // 记录进入快速恢复时的最高发送序列号。
-	int send_waiting_threads;	 // 当前因发送窗口满而阻塞等待的线程数量。
+	int send_waiting_threads;	 // 当前因发送窗口满而阻塞等待的线程数量，用于驱动零窗口探测机制。
 
 	// 往返时间（RTT）估计与超时重传间隔（RTO）计算参数。
-	double estimated_rtt;  // 平滑往返时间（秒）。
-	double dev_rtt;		   // 往返时间偏差均值（秒）。
-	double rto;			   // 当前超时重传阈值（秒）。
-	bool rto_pending;	   // RTO 超时重传且尚未收到新确认的挂起状态标志。
-	std::chrono::steady_clock::time_point rto_timer_start;  // RTO 重传定时器的起始/重启绝对时间点。
+	double estimated_rtt;									// 平滑往返时间（秒）。
+	double dev_rtt;											// 往返时间偏差均值（秒）。
+	double rto;												// 当前超时重传阈值（秒）。
+	bool rto_pending;										// RTO 超时重传且尚未收到新确认的挂起状态标志。
+	std::chrono::steady_clock::time_point rto_timer_start;	// RTO 重传定时器的起始/重启绝对时间点。
 
 	// 服务端监听套接字专用的半连接/全连接队列。
 	std::queue<TcpSocket*> completed_queue;	 // 已完成三次握手的子套接字指针队列。

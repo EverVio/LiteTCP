@@ -11,8 +11,9 @@
 #include "NetworkEngine.h"
 #include "TimerManager.h"
 
-// 设定接收缓冲区最大限制以及每个 TCP 报文段的 MSS 大小（排除 20 字节首部后为 1380 字节）。
+// 接收缓冲区最大限制。
 constexpr size_t MAX_RECV_BUF_SIZE = 65536;
+// TCP 最大报文段长度（MSS），减去 TCP 头部长度（20 字节）。单次发送的数据段不应超过 MSS，以避免 IP 分片。
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 TcpSocket::TcpSocket()
@@ -193,10 +194,12 @@ int TcpSocket::send(const void* buffer, int len) {
 
 			// 当拥塞窗口或接收滑动窗口已满时挂起线程，直到有确认的 ACK 带来窗口滑动的通知。
 			send_cv.wait(lock, [this]() {
+				// 计算当前可发送窗口
 				uint32_t curr_wnd = std::min(static_cast<uint32_t>(cwnd), peer_rwnd);
-				if (peer_rwnd > 0 && curr_wnd < MSS) {
+				if (peer_rwnd > 0 && curr_wnd < MSS)
 					curr_wnd = MSS;	 // 零窗口探测防止死锁保护。
-				}
+
+				// 计算在途飞行数据量（已发未确认字节数）
 				uint32_t flight_size = snd_nxt - snd_una;
 				return (peer_rwnd > 0 && flight_size < curr_wnd) || state != TcpState::ESTABLISHED;
 			});
@@ -204,27 +207,27 @@ int TcpSocket::send(const void* buffer, int len) {
 			send_waiting_threads--;
 			update_timer_locked();
 
-			if (state != TcpState::ESTABLISHED) {
+			if (state != TcpState::ESTABLISHED)
 				return -1;
-			}
 
 			uint32_t flight_size = snd_nxt - snd_una;
 			uint32_t curr_wnd = std::min(static_cast<uint32_t>(cwnd), peer_rwnd);
-			if (peer_rwnd > 0 && curr_wnd < MSS) {
+
+			// 零窗口探测保护：当对端通告窗口为零时，仍然允许发送 1 个 MSS 的探测包。
+			if (peer_rwnd > 0 && curr_wnd < MSS)
 				curr_wnd = MSS;
-			}
+
 			uint32_t allowed_to_send = 0;
-			if (curr_wnd > flight_size) {
+			if (curr_wnd > flight_size)
 				allowed_to_send = curr_wnd - flight_size;
-			}
 
 			// 计算本次发送段的大小，受发送窗口配额、剩余长度与 MSS 三者限制。
 			int chunk_size = std::min({static_cast<int>(allowed_to_send), len - bytes_sent, static_cast<int>(MSS)});
-			if (chunk_size <= 0) {
+			if (chunk_size <= 0)
 				continue;
-			}
 
 			std::vector<uint8_t> payload(byte_buf + bytes_sent, byte_buf + bytes_sent + chunk_size);
+			// 构造 TCP 数据包，自动计算校验和并序列化为字节数组。默认带有 ACK 标志（捎带应答）。
 			TcpPacket pkt(local_addr.port, remote_addr.port, snd_nxt, rcv_nxt, TCP_FLAG_ACK,
 						  get_advertised_window(), payload);
 
@@ -237,10 +240,10 @@ int TcpSocket::send(const void* buffer, int len) {
 			sent_pkt.len = chunk_size;
 			sent_pkt.retransmit_count = 0;
 			sent_pkt.send_time = std::chrono::steady_clock::now();
-			
-			if (sent_packets.empty()) {
+
+			if (sent_packets.empty())
 				rto_timer_start = sent_pkt.send_time;
-			}
+
 			sent_packets.push_back(sent_pkt);
 
 			// 更新已发送的序列号前缘。
@@ -261,7 +264,7 @@ int TcpSocket::send(const void* buffer, int len) {
 int TcpSocket::recv(void* buffer, int len) {
 	std::unique_lock<std::mutex> lock(socket_mutex);
 
-	// 阻塞等待直到环形接收缓冲区有可用数据，或者连接已断开、收到 FIN 进入关闭处理流程。
+	// 阻塞等待直到环形接收缓冲区有可用数据，或者进入半连接、被动关闭或完全关闭状态。
 	recv_cv.wait(lock, [this]() {
 		return !recv_buf.empty() || state == TcpState::CLOSE_WAIT ||
 			   state == TcpState::LAST_ACK || state == TcpState::CLOSED;
@@ -269,9 +272,8 @@ int TcpSocket::recv(void* buffer, int len) {
 
 	if (recv_buf.empty()) {
 		// 缓冲区为空且状态变为被动关闭或关闭，返回 0 代表正常收到对端发送的 EOF 标志。
-		if (state == TcpState::CLOSE_WAIT || state == TcpState::LAST_ACK || state == TcpState::CLOSED) {
+		if (state == TcpState::CLOSE_WAIT || state == TcpState::LAST_ACK || state == TcpState::CLOSED)
 			return 0;
-		}
 		return -1;
 	}
 
@@ -282,14 +284,21 @@ int TcpSocket::recv(void* buffer, int len) {
 
 	size_t after_free = recv_buf.free_space();
 
-	// 如果读出数据使接收窗口产生显著释放，主动发送 ACK 以向发送端更新通告窗口。
+	// 如果每次读取都立即回复 ACK，会导致 ACK 泛滥。需要同时满足以下条件：
+	// 1. 读取了有效数据（read_len > 0）。
+	// 2. 连接处于数据传递阶段（非挥手收尾状态）。
 	if (read_len > 0 && (state == TcpState::ESTABLISHED || state == TcpState::FIN_WAIT_1 || state == TcpState::FIN_WAIT_2)) {
 		size_t cap = MAX_RECV_BUF_SIZE;
+		// 3. 缓冲区此前接近饱和（before_free < 2 * MSS），说明之前已通告零窗口或极窄窗口，对端正被阻塞。
+		// 4. 释放空间足够显著。
 		if (before_free < 2 * MSS && (after_free - before_free >= MSS || after_free >= cap / 2)) {
 			send_control_packet(TCP_FLAG_ACK);
 			write_log("window_update_sent");
 		}
 	}
+	// 这样设计的好处：
+	// 1. 避免糊涂窗口综合征（SWS）
+	// 2. 减少 ACK 包数量，将窗口更新与后续数据包捎带结合，降低网络负载。
 
 	write_log("data_recv");
 	return read_len;
@@ -303,6 +312,8 @@ int TcpSocket::close() {
 		return sent_packets.empty() || state != TcpState::ESTABLISHED;
 	});
 
+	bool timeout = false;
+
 	if (state == TcpState::ESTABLISHED) {
 		// 主动关闭逻辑：迁移至 FIN_WAIT_1 并向对端发送 FIN。
 		state = TcpState::FIN_WAIT_1;
@@ -310,9 +321,11 @@ int TcpSocket::close() {
 		send_control_packet(TCP_FLAG_FIN);
 
 		// 阻塞直到本端发出的 FIN 确认且连接完全关闭，或者进入 TIME_WAIT 状态（最长等待 10 秒）。
-		close_cv.wait_for(lock, std::chrono::seconds(10), [this]() {
-			return state == TcpState::CLOSED || state == TcpState::TIME_WAIT;
-		});
+		if (!close_cv.wait_for(lock, std::chrono::seconds(10), [this]() {
+				return state == TcpState::CLOSED || state == TcpState::TIME_WAIT;
+			})) {
+			timeout = true;
+		}
 	} else if (state == TcpState::CLOSE_WAIT) {
 		// 被动关闭逻辑：迁移至 LAST_ACK 并发送本端 FIN 包。
 		state = TcpState::LAST_ACK;
@@ -320,9 +333,25 @@ int TcpSocket::close() {
 		send_control_packet(TCP_FLAG_FIN);
 
 		// 等待对端最后的 ACK 确认。
-		close_cv.wait_for(lock, std::chrono::seconds(10), [this]() {
-			return state == TcpState::CLOSED;
-		});
+		if (!close_cv.wait_for(lock, std::chrono::seconds(10), [this]() {
+				return state == TcpState::CLOSED;
+			})) {
+			timeout = true;
+		}
+	}
+
+	// 如果挥手超时，强行转入 CLOSED 状态并剥离物理路由，防止内存释放后网络层回调野指针
+	if (timeout) {
+		state = TcpState::CLOSED;
+		write_log("close_timeout_forced_cleanup");
+		NetworkEngine::unregister_established_socket(local_addr.port, remote_addr.port);
+
+		// 通知所有等待的线程连接已关闭，避免它们继续被挂起。
+		recv_cv.notify_all();
+		send_cv.notify_all();
+		close_cv.notify_all();
+
+		update_timer_locked();
 	}
 
 	return 0;
@@ -336,6 +365,7 @@ void TcpSocket::send_control_packet(uint8_t flags) {
 	std::vector<uint8_t> serialized = pkt.serialize();
 
 	// SYN 或 FIN 包虽然不带载荷，但在逻辑上占用 1 个序列号，需加入发送队列用以超时重传。
+	// 纯 ACK 包不占用序列号，不加入重传队列。
 	if ((flags & TCP_FLAG_SYN) || (flags & TCP_FLAG_FIN)) {
 		SentPacket sent_pkt;
 		sent_pkt.seq = snd_nxt;
