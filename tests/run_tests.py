@@ -210,11 +210,11 @@ def main():
     parser.add_argument(
         "--drop",
         type=float,
-        default=0.02,
+        default=0.002,
         help="Packet drop rate (0.0 to 1.0) for reliable test",
     )
     parser.add_argument(
-        "--delay", type=int, default=20, help="Packet delay in ms for reliable test"
+        "--delay", type=int, default=30, help="Packet delay in ms for reliable test"
     )
     parser.add_argument(
         "--size",

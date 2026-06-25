@@ -3,11 +3,12 @@
 
 #include <algorithm>
 #include <iostream>
+#include <thread>
 
 #include "NetworkEngine.h"
 #include "TimerManager.h"
 
-constexpr size_t MAX_RECV_BUF_SIZE = 65536;
+constexpr size_t MAX_RECV_BUF_SIZE = 524288;
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 void TcpSocket::retransmit_packet(SentPacket& pkt) {
@@ -15,6 +16,8 @@ void TcpSocket::retransmit_packet(SentPacket& pkt) {
 	pkt.send_time = std::chrono::steady_clock::now();
 	pkt.retransmit_count++;
 	NetworkEngine::send_packet(pkt.data);
+
+	rto_timer_start = pkt.send_time;
 }
 
 void TcpSocket::update_timer_locked() {
@@ -90,6 +93,32 @@ void TcpSocket::handle_timeout() {
 		auto& oldest = sent_packets.front();
 		double elapsed = std::chrono::duration<double>(now - rto_timer_start).count();
 		if (elapsed >= rto) {
+			// 检测并限制最大重传次数，超过次数则直接关闭连接并释放资源。
+			int max_retrans = (state == TcpState::SYN_RECV || state == TcpState::SYN_SENT) ? 5 : 15;
+			if (oldest.retransmit_count >= max_retrans) {
+				if (state == TcpState::SYN_RECV) {
+					state = TcpState::CLOSED;
+					write_log("syn_recv_timeout_abandoned");
+					NetworkEngine::unregister_established_socket(local_addr.port, remote_addr.port);
+					std::thread([this]() { delete this; }).detach();
+					return;
+				} else if (state == TcpState::SYN_SENT) {
+					state = TcpState::CLOSED;
+					write_log("connect_failed_timeout");
+					NetworkEngine::unregister_established_socket(local_addr.port, remote_addr.port);
+					conn_cv.notify_all();
+					return;
+				} else {
+					state = TcpState::CLOSED;
+					write_log("transmission_timeout_closed");
+					NetworkEngine::unregister_established_socket(local_addr.port, remote_addr.port);
+					recv_cv.notify_all();
+					send_cv.notify_all();
+					close_cv.notify_all();
+					return;
+				}
+			}
+
 			retransmit_packet(oldest);
 
 			rto = std::min(rto * 2.0, 5.0);
@@ -98,6 +127,7 @@ void TcpSocket::handle_timeout() {
 			}
 			cwnd = static_cast<double>(MSS);
 			congestion_state = 0;
+			rto_recover = snd_nxt;
 			dup_ack_count = 0;
 			rto_pending = true;
 			rto_timer_start = now;

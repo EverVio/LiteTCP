@@ -58,6 +58,10 @@ void run_server(int case_num, size_t payload_size = 5 * 1024 * 1024) {
 		size_t last_report = 0;
 		size_t report_interval = 512 * 1024;  // 每接收 512 KB 打印一次实时进度。
 		while (received.size() < payload_size) {
+			// 引入应用层处理延迟（例如每读取一次休眠 2ms）
+			// 迫使接收缓冲区积压，从而使通告窗口 rwnd 动态减小甚至归零
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
 			int n = litetcp_recv(conn, buf.data(), buf.size());
 			if (n <= 0) {
 				break;
@@ -143,6 +147,8 @@ void run_client(int case_num, double drop_rate = 0.05, int delay_ms = 10, size_t
 
 		std::cout << "[Client Case 2] Sending " << (payload_size / 1024.0 / 1024.0) << "MB dataset..." << std::endl;
 		litetcp_send(client, test_data.data(), test_data.size());
+
+		std::this_thread::sleep_for(std::chrono::seconds(3));
 
 		litetcp_close(client);
 	}

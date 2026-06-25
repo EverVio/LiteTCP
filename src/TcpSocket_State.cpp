@@ -8,7 +8,7 @@
 
 #include "NetworkEngine.h"
 
-constexpr size_t MAX_RECV_BUF_SIZE = 65536;
+constexpr size_t MAX_RECV_BUF_SIZE = 524288;
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 void TcpSocket::handle_packet(const TcpPacket& packet) {
@@ -58,8 +58,9 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 			TcpSocket* existing = NetworkEngine::get_established_socket();
 			if (existing) {
 				if (existing->get_remote_addr().port == packet.header.source_port) {
-					// 收到重复的 SYN 包，直接重传 SYN+ACK
-					existing->send_control_packet(TCP_FLAG_SYN | TCP_FLAG_ACK);
+					// 收到重复的 SYN 包，重传缓存中的首个 SYN+ACK 报文以唤醒对端，避免重传导致序列号偏大
+					if (!existing->sent_packets.empty())
+						existing->retransmit_packet(existing->sent_packets.front());
 					return;
 				} else if (existing->get_state() == TcpState::SYN_RECV)
 					// 新的客户端发来 SYN，且之前的子套接字仍处于半连接状态（未完成握手），直接释放
@@ -116,8 +117,9 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 	// 清空重传队列并将状态迁移至 ESTABLISHED，最后将子套接字推入监听套接字的全连接队列中并唤醒 accept 线程。
 	if (state == TcpState::SYN_RECV) {
 		if ((flags & TCP_FLAG_SYN) && !(flags & TCP_FLAG_ACK)) {
-			// 收到重复的 SYN 包，重传 SYN+ACK 响应以唤醒对端。
-			send_control_packet(TCP_FLAG_SYN | TCP_FLAG_ACK);
+			// 收到重复的 SYN 包，重传缓存中的首个 SYN+ACK 报文以唤醒对端，避免重传导致序列号偏大
+			if (!sent_packets.empty())
+				retransmit_packet(sent_packets.front());
 			return;
 		}
 		if ((flags & TCP_FLAG_ACK) && !(flags & TCP_FLAG_SYN)) {
@@ -130,6 +132,7 @@ void TcpSocket::handle_handshake_packet(const TcpPacket& packet) {
 
 				if (parent) {
 					std::lock_guard<std::mutex> p_lock(parent->socket_mutex);
+					// 推入父监听套接字的全连接队列
 					parent->completed_queue.push(this);
 					parent->recv_cv.notify_all();
 				}
@@ -159,22 +162,27 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 	uint32_t ack = packet.header.ack_num;
 
 	if (flags & TCP_FLAG_ACK) {
+		// 阶段一：更新对端的剩余接收窗口大小
 		uint32_t old_rwnd = peer_rwnd;
 		peer_rwnd = packet.header.advertised_window;
-		if (peer_rwnd > 0 && old_rwnd == 0) {
+		// 如果 old_rwnd == 0（之前对端窗口满了，发送端被阻塞），
+		// 而现在 peer_rwnd > 0（对端窗口恢复了），则唤醒所有阻塞在 send 的线程。
+		if (peer_rwnd > 0 && old_rwnd == 0)
 			send_cv.notify_all();
-		}
 
+		// 阶段二：处理新的确认号
 		if (ack > snd_una) {
-			// 收到新的确认号，更新发送窗口左边缘。
+			// 1. 滑动窗口与重传标记
 			snd_una = ack;
 			rto_pending = false;
 
-			// 计算精确往返时间（RTT）与超时阈值（RTO），根据 Karn 算法排除包含重传的报文。
+			// 2. 计算精确往返时间（RTT）与超时阈值（RTO），根据 Karn 算法排除包含重传的报文。
 			auto now = std::chrono::steady_clock::now();
-			rto_timer_start = now;
 			double sample_rtt = -1.0;
 			bool has_retransmitted = false;
+
+			// Karn 算法：如果一个包被重传过（retransmit_count > 0），
+			// 那么这次收到的 ACK 所测得的 RTT 样本不可信，直接丢弃，不更新 estimated_rtt。
 			for (const auto& p : sent_packets) {
 				if (p.seq + p.len <= ack) {
 					if (p.retransmit_count > 0) {
@@ -184,6 +192,7 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 				}
 			}
 
+			// 计算 sample_rtt
 			if (!has_retransmitted) {
 				for (const auto& p : sent_packets) {
 					if (p.seq + p.len <= ack) {
@@ -195,13 +204,14 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 			}
 
 			if (sample_rtt > 0.0) {
-				estimated_rtt = estimated_rtt + 0.125 * (sample_rtt - estimated_rtt);
-				dev_rtt = dev_rtt + 0.25 * (std::abs(sample_rtt - estimated_rtt) - dev_rtt);
+				double diff = sample_rtt - estimated_rtt;
+				estimated_rtt += 0.125 * diff;
+				dev_rtt += 0.25 * (std::abs(diff) - dev_rtt);
 				rto = estimated_rtt + 4 * dev_rtt;
-				rto = std::max(0.02, std::min(rto, 5.0));  // 保证 RTO 在 20ms 到 5s 的安全区间内。
+				rto = std::max(0.20, std::min(rto, 5.0));  // 保证 RTO 在 200ms 到 5s 的安全区间内。
 			}
 
-			// 清理已被确认的数据包缓存。
+			// 3. 清理已确认的发送缓存。
 			sent_packets.erase(
 				std::remove_if(sent_packets.begin(), sent_packets.end(),
 							   [ack](const SentPacket& p) {
@@ -209,32 +219,44 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 							   }),
 				sent_packets.end());
 
-			// 基于 TCP Reno 算法的拥塞控制更新逻辑，分慢启动、拥塞避免和快速恢复三种情况进行 cwnd 的增减。
+			// 收到新 ACK 后，若仍有未确认的数据，应将 RTO 超时起点更新为当前队列中最老未确认包的发送时间
+			if (!sent_packets.empty()) {
+				rto_timer_start = sent_packets.front().send_time;
+			}
+
+			// 4. 基于 TCP Reno 算法的拥塞控制更新逻辑，分慢启动、拥塞避免和快速恢复三种情况进行 cwnd 的增减。
 			if (congestion_state == 0) {
 				cwnd += MSS;  // 慢启动：每收到 1 个新 ACK，拥塞窗口 cwnd 增加 1 MSS。
-				if (cwnd >= ssthresh) {
-					congestion_state = 1;
-				}
-			} else if (congestion_state == 1) {
-				cwnd += (static_cast<double>(MSS) * MSS) / cwnd;  // 拥塞避免：每个 RTT 周期内，cwnd 大约增加 1 MSS。
-			} else if (congestion_state == 2) {
-				if (ack >= recover) {
-					// 收到完全确认（Full ACK），退出快速恢复阶段，回到拥塞避免。
-					congestion_state = 1;
-					cwnd = static_cast<double>(ssthresh);
-				} else {
-					// 收到部分确认（Partial ACK），触发 NewReno 重传未确认的最老报文，并按规范扣减拥塞窗口。
+				if (cwnd >= ssthresh)
+					congestion_state = 1;  // 达到慢启动阈值，进入拥塞避免阶段。
+
+				// NewReno-style RTO recovery: 如果在慢启动阶段收到一个部分确认（Partial ACK）
+				if (ack < rto_recover) {
 					if (!sent_packets.empty()) {
 						retransmit_packet(sent_packets.front());
 					}
+				} else if (rto_pending) {
+					rto_pending = false;
+					rto_recover = 0;
+				}
+			} else if (congestion_state == 1)
+				cwnd += (static_cast<double>(MSS) * MSS) / cwnd;  // 拥塞避免：每个 RTT 周期内，cwnd 大约增加 1 MSS。
+			else if (congestion_state == 2) {
+				if (ack >= recover) {
+					// 收到完全确认，退出快速恢复阶段，回到拥塞避免。
+					congestion_state = 1;
+					cwnd = static_cast<double>(ssthresh);
+				} else {
+					// 收到部分确认，触发 NewReno 重传未确认的最老报文，并调整拥塞窗口。
+					if (!sent_packets.empty())
+						retransmit_packet(sent_packets.front());
 
 					uint32_t confirmed_bytes = ack - last_ack_received;
 					cwnd = cwnd - confirmed_bytes + MSS;
 
 					// 避免大块确认使 cwnd 变为负数或极小值。
-					if (cwnd < ssthresh) {
+					if (cwnd < ssthresh)
 						cwnd = ssthresh;
-					}
 
 					congestion_state = 2;
 				}
@@ -247,7 +269,7 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 			send_cv.notify_all();
 			close_cv.notify_all();
 			write_log("ack_received");
-		} else if (ack == snd_una) {
+		} else if (ack == snd_una) {  // 阶段三：处理重复确认号
 			// 如果处于 ESTABLISHED 状态且收到了对端重传的 SYN+ACK，
 			// 说明对端没收到第三次握手的 ACK，必须立刻回传一个纯 ACK 以完成握手。
 			if ((state == TcpState::ESTABLISHED) && (flags & TCP_FLAG_SYN)) {
@@ -256,7 +278,11 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 				return;
 			}
 
-			// 收到重复的确认号，仅在有未确认数据且该包是无载荷纯控制包时进行冗余 ACK 计数。
+			// 收到重复的确认号。只有满足特定条件时，才认为是真正的重复 ACK：
+			// 1. 已发送但未确认的数据包队列不为空。
+			// 2. 当前收到的包没有载荷（纯 ACK）。
+			// 3. 当前没有挂起的 RTO 超时重传。
+			// 4. 对端的接收窗口没有变化（peer_rwnd == old_rwnd）。
 			if (!sent_packets.empty() && payload_len == 0 && !rto_pending && peer_rwnd == old_rwnd) {
 				dup_ack_count++;
 				write_log("dup_ack");
@@ -268,17 +294,14 @@ void TcpSocket::process_ack(const TcpPacket& packet, size_t payload_len) {
 				} else {
 					if (dup_ack_count == 3) {
 						congestion_state = 2;
-						recover = snd_nxt;	// 记录进入快速恢复时的边界序列号。
-						ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
+						recover = snd_nxt;												// 记录进入快速恢复时的边界序列号。
+						ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);	// 阈值减半
 						cwnd = ssthresh + 3 * MSS;
 
-						if (!sent_packets.empty()) {
+						if (!sent_packets.empty())
 							retransmit_packet(sent_packets.front());
-						}
+
 						write_log("fast_retransmit");
-					} else if (dup_ack_count > 3) {
-						cwnd += MSS;  // 快速恢复阶段继续收到重复 ACK，临时膨胀 cwnd 并尝试发送新数据。
-						send_cv.notify_all();
 					}
 				}
 			}
@@ -294,9 +317,8 @@ void TcpSocket::process_payload(const TcpPacket& packet, size_t payload_len) {
 		uint32_t end_seq = seq + payload_len;
 
 		// 去重：截断已经确认过的重叠历史数据。
-		if (start_seq < rcv_nxt) {
+		if (start_seq < rcv_nxt)
 			start_seq = rcv_nxt;
-		}
 
 		if (start_seq < end_seq) {
 			uint32_t offset = start_seq - seq;
@@ -311,63 +333,86 @@ void TcpSocket::process_payload(const TcpPacket& packet, size_t payload_len) {
 				// 在乱序表记录当前落盘的区间。
 				add_interval(start_seq, end_seq);
 
-				if (start_seq > rcv_nxt) {
+				if (start_seq > rcv_nxt)
 					write_log("data_out_of_order");
-				}
 			}
 		}
 
-		// 检查乱序区间队列头部是否与当前等待的接收序列号重合。若重合则表示有连续数据转正，推进接收窗口并唤醒 recv 调用。
+		// 检查乱序区间队列头部是否与当前等待的接收序列号重合。
+		// 若重合则表示有连续数据转正，推进接收窗口并唤醒 recv 调用。
 		if (ooo_count > 0 && ooo_intervals[0].first == rcv_nxt) {
 			uint32_t consecutive_len = ooo_intervals[0].second - ooo_intervals[0].first;
 
 			recv_buf.advance_tail(consecutive_len);
 			rcv_nxt = ooo_intervals[0].second;
 
-			for (size_t i = 1; i < ooo_count; i++) {
+			for (size_t i = 1; i < ooo_count; i++)
 				ooo_intervals[i - 1] = ooo_intervals[i];
-			}
+
 			ooo_count--;
 
 			recv_cv.notify_all();
 			write_log("data_ordered");
 		}
 
+		bool fin_processed = false;
+		if (has_ooo_fin && rcv_nxt == ooo_fin_seq) {
+			has_ooo_fin = false;
+			do_process_fin(ooo_fin_seq, ooo_fin_ack);
+			fin_processed = true;
+		}
+
 		// 只要接收了载荷数据，不管是有序还是乱序，都必须回复 ACK。
-		send_control_packet(TCP_FLAG_ACK);
+		// 如果刚刚已经处理了 FIN 且发送了 ACK，这里就不用重复发送 ACK 了。
+		if (!fin_processed) {
+			send_control_packet(TCP_FLAG_ACK);
+		}
 	}
+}
+
+void TcpSocket::do_process_fin(uint32_t fin_seq, uint32_t ack) {
+	rcv_nxt = fin_seq + 1;	// FIN 报文段逻辑上占 1 字节序列号。
+	send_control_packet(TCP_FLAG_ACK);
+
+	if (state == TcpState::ESTABLISHED) {
+		state = TcpState::CLOSE_WAIT;
+		write_log("state_close_wait");
+		recv_cv.notify_all();
+	} else if (state == TcpState::FIN_WAIT_1) {
+		if (ack >= snd_nxt || snd_una >= snd_nxt) {
+			// 己方 FIN 已经被 ACK 且收到对方 FIN，直接进入 TIME_WAIT。
+			state = TcpState::TIME_WAIT;
+			write_log("state_time_wait");
+			last_zero_window_probe_time = std::chrono::steady_clock::now();
+		} else {
+			// 收到对端 FIN 但对方还未确认己方的 FIN，进入 CLOSING。
+			state = TcpState::CLOSING;
+			write_log("state_closing");
+		}
+	} else if (state == TcpState::FIN_WAIT_2) {
+		state = TcpState::TIME_WAIT;
+		write_log("state_time_wait");
+		last_zero_window_probe_time = std::chrono::steady_clock::now();
+	}
+	close_cv.notify_all();
 }
 
 void TcpSocket::process_fin(const TcpPacket& packet) {
 	uint8_t flags = packet.header.flags;
 	uint32_t seq = packet.header.seq_num;
 	uint32_t ack = packet.header.ack_num;
+	size_t payload_len = packet.data.size();
+	uint32_t fin_seq = seq + payload_len;
 
 	if (flags & TCP_FLAG_FIN) {
-		rcv_nxt = seq + 1;	// FIN 报文段逻辑上占 1 字节序列号。
-		send_control_packet(TCP_FLAG_ACK);
-
-		if (state == TcpState::ESTABLISHED) {
-			state = TcpState::CLOSE_WAIT;
-			write_log("state_close_wait");
-			recv_cv.notify_all();
-		} else if (state == TcpState::FIN_WAIT_1) {
-			if (ack >= snd_nxt) {
-				// 己方 FIN 已经被 ACK 且收到对方 FIN，直接进入 TIME_WAIT。
-				state = TcpState::TIME_WAIT;
-				write_log("state_time_wait");
-				last_zero_window_probe_time = std::chrono::steady_clock::now();
-			} else {
-				// 收到对端 FIN 但对方还未确认己方的 FIN，进入 CLOSING。
-				state = TcpState::CLOSING;
-				write_log("state_closing");
-			}
-		} else if (state == TcpState::FIN_WAIT_2) {
-			state = TcpState::TIME_WAIT;
-			write_log("state_time_wait");
-			last_zero_window_probe_time = std::chrono::steady_clock::now();
+		if (fin_seq == rcv_nxt) {
+			do_process_fin(fin_seq, ack);
+		} else if (fin_seq > rcv_nxt) {
+			has_ooo_fin = true;
+			ooo_fin_seq = fin_seq;
+			ooo_fin_ack = ack;
+			write_log("fin_out_of_order");
 		}
-		close_cv.notify_all();
 	}
 }
 

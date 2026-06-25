@@ -145,12 +145,17 @@ private:
 	RingBuffer recv_buf;			// 接收缓冲区，使用环形队列减少内存移动开销。
 	std::vector<uint8_t> send_buf;	// 发送缓冲区，暂存应用层调用 send 发送的数据。
 
-	static constexpr size_t MAX_OOO_INTERVALS = 64;								 // 最大允许维护的乱序数据区间上限。
+	static constexpr size_t MAX_OOO_INTERVALS = 128;								 // 最大允许维护的乱序数据区间上限。
 	std::array<std::pair<uint32_t, uint32_t>, MAX_OOO_INTERVALS> ooo_intervals;	 // 静态分配的乱序区间映射表。
 	size_t ooo_count = 0;														 // 当前活跃的乱序区间个数。
 
+	bool has_ooo_fin = false;													 // 是否存在乱序 FIN 报文。
+	uint32_t ooo_fin_seq = 0;													 // 乱序 FIN 报文的逻辑序列号。
+	uint32_t ooo_fin_ack = 0;													 // 乱序 FIN 报文对应的 ACK 号。
+
 	// 将新的乱序区间插入表并尝试与前后重叠区间合并。
 	void add_interval(uint32_t start, uint32_t end);
+	void do_process_fin(uint32_t fin_seq, uint32_t ack);
 
 	// 生命周期及数据处理辅助函数 (用于重构 handle_packet)
 	void handle_handshake_packet(const TcpPacket& packet);
@@ -177,6 +182,7 @@ private:
 	uint32_t last_ack_received;	 // 上一次收到的确认号。
 	int congestion_state;		 // 当前拥塞状态（0为慢启动，1为拥塞避免，2为快速恢复）。
 	uint32_t recover;			 // 记录进入快速恢复时的最高发送序列号。
+	uint32_t rto_recover;		 // 记录进入 RTO 超时重传时的最高发送序列号。
 	int send_waiting_threads;	 // 当前因发送窗口满而阻塞等待的线程数量，用于驱动零窗口探测机制。
 
 	// 往返时间（RTT）估计与超时重传间隔（RTO）计算参数。

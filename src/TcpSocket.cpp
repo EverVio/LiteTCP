@@ -12,19 +12,20 @@
 #include "TimerManager.h"
 
 // 接收缓冲区最大限制。
-constexpr size_t MAX_RECV_BUF_SIZE = 65536;
+constexpr size_t MAX_RECV_BUF_SIZE = 524288;
 // TCP 最大报文段长度（MSS），减去 TCP 头部长度（20 字节）。单次发送的数据段不应超过 MSS，以避免 IP 分片。
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 TcpSocket::TcpSocket()
 	: state(TcpState::CLOSED),
 	  rcv_nxt(0),
-	  peer_rwnd(32 * MSS),
-	  cwnd(static_cast<double>(MSS)),
-	  ssthresh(32 * MSS),
+	  peer_rwnd(static_cast<uint32_t>(MAX_RECV_BUF_SIZE)),
+	  cwnd(static_cast<double>(10 * MSS)),
+	  ssthresh(static_cast<uint32_t>(MAX_RECV_BUF_SIZE)),
 	  dup_ack_count(0),
 	  congestion_state(0),	// 拥塞状态默认为 0（慢启动阶段）。
 	  recover(0),
+	  rto_recover(0),
 	  send_waiting_threads(0),
 	  estimated_rtt(0.1),
 	  dev_rtt(0.05),
@@ -32,6 +33,9 @@ TcpSocket::TcpSocket()
 	  rto_pending(false),
 	  rto_timer_start(std::chrono::steady_clock::now()),
 	  active_event_id(0),
+	  has_ooo_fin(false),
+	  ooo_fin_seq(0),
+	  ooo_fin_ack(0),
 	  recv_buf(MAX_RECV_BUF_SIZE) {
 	// 使用随机数作为本端连接的初始序列号（ISN），并初始化发送窗口。
 	std::random_device rd;
@@ -68,7 +72,6 @@ TcpSocket::~TcpSocket() {
 
 void TcpSocket::write_log(const std::string& event) {
 	if (!csv_log.is_open()) {
-		// 根据本地绑定的端口号创建独立的性能分析 CSV 日志文件，默认输出至 test_results 目录。
 		std::string filename = "test_results/metrics_" + std::to_string(local_addr.port) + ".csv";
 		csv_log.open(filename, std::ios::app);
 		if (!csv_log.is_open()) {
@@ -79,15 +82,13 @@ void TcpSocket::write_log(const std::string& event) {
 
 		csv_log.seekp(0, std::ios::end);
 		if (csv_log.tellp() == 0) {
-			// 在全新创建的文件头部写入 CSV 各列字段名称。
-			csv_log << "Timestamp,TcpState,cwnd,ssthresh,rwnd,seq_num,ack_num,Event\n";
+			csv_log << "Timestamp,TcpState,cwnd,ssthresh,rwnd,seq_num,ack_num,rto,ooo_count,Event\n";
 		}
 	}
 
 	auto now = std::chrono::steady_clock::now();
 	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
 
-	// 输出当前的时间戳、状态机阶段、拥塞控制指标及滑动窗口实时数据。
 	csv_log << elapsed << ","
 			<< state_to_string(state) << ","
 			<< static_cast<int>(cwnd) << ","
@@ -95,10 +96,11 @@ void TcpSocket::write_log(const std::string& event) {
 			<< peer_rwnd << ","
 			<< snd_nxt << ","
 			<< rcv_nxt << ","
+			<< rto << ","		 // 记录动态 RTO 值
+			<< ooo_count << ","	 // 记录当前堆积的乱序区间数量
 			<< event << "\n";
 	csv_log.flush();
 }
-
 int TcpSocket::bind(LiteSockAddr bind_addr) {
 	std::lock_guard<std::mutex> lock(socket_mutex);
 	local_addr = bind_addr;
