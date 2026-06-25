@@ -8,7 +8,7 @@
 #include "NetworkEngine.h"
 #include "TimerManager.h"
 
-constexpr size_t MAX_RECV_BUF_SIZE = 524288;
+constexpr size_t MAX_RECV_BUF_SIZE = 64800;
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
 void TcpSocket::retransmit_packet(SentPacket& pkt) {

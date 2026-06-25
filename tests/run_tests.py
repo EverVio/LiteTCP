@@ -152,13 +152,50 @@ def run_reliable_tests(drop_rate=0.05, delay_ms=10, payload_size=5242880):
         clean_test_outputs()
 
         print(
-            f"\n--- Running Case 2: {payload_size / (1024*1024):.2f}MB File Transfer under {drop_rate*100:.1f}% Packet Loss & {delay_ms}ms Delay ---"
+            f"\n--- Running Case 2: {payload_size / (1024*1024):.2f}MB File Transfer under Multi-stage Network Conditions ---"
         )
         server = run_case("test_reliable", "--server", 2, payload_size)
         time.sleep(0.5)
-        client = run_case(
-            "test_reliable", "--client", 2, drop_rate, delay_ms, payload_size
-        )
+        client = run_case("test_reliable", "--client", 2, 0.0, 10, payload_size)
+
+        import socket
+        import threading
+
+        def notify_proxy(cmd):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.sendto(cmd.encode("utf-8"), ("127.0.0.1", 20217))
+                s.close()
+            except Exception as e:
+                print(f"[Orchestrator] Failed to notify proxy: {e}")
+
+        def network_controller():
+            print(
+                "[Orchestrator] Stage 1 (0-2s): 0.0% loss, 10ms delay (Flow Control limit)"
+            )
+            notify_proxy("SET_DROP_RATE 0.0")
+            notify_proxy("SET_DELAY 10")
+
+            time.sleep(2.0)
+
+            print(
+                "[Orchestrator] Stage 2 (2-5s): 0.1% loss, 10ms delay (Fast Retransmit & Sawtooth)"
+            )
+            notify_proxy("SET_DROP_RATE 0.025")
+
+            time.sleep(3.0)
+
+            print("[Orchestrator] Stage 3 (5-5.5s): 100% loss (Blackout / RTO Timeout)")
+            notify_proxy("SET_DROP_RATE 1.0")
+
+            time.sleep(0.5)
+
+            print("[Orchestrator] Stage 3 Recovery (5.5s+): Restore to 0.1% loss")
+            notify_proxy("SET_DROP_RATE 0.0")
+
+        control_thread = threading.Thread(target=network_controller)
+        control_thread.daemon = True
+        control_thread.start()
 
         c_ret = client.wait()
         s_ret = server.wait()
@@ -210,7 +247,7 @@ def main():
     parser.add_argument(
         "--drop",
         type=float,
-        default=0.002,
+        default=0.005,
         help="Packet drop rate (0.0 to 1.0) for reliable test",
     )
     parser.add_argument(

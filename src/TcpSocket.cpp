@@ -12,7 +12,7 @@
 #include "TimerManager.h"
 
 // 接收缓冲区最大限制。
-constexpr size_t MAX_RECV_BUF_SIZE = 524288;
+constexpr size_t MAX_RECV_BUF_SIZE = 64800;
 // TCP 最大报文段长度（MSS），减去 TCP 头部长度（20 字节）。单次发送的数据段不应超过 MSS，以避免 IP 分片。
 constexpr uint32_t MSS = 1400 - sizeof(TcpHeader);
 
