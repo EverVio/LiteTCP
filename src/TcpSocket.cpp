@@ -377,6 +377,10 @@ void TcpSocket::send_control_packet(uint8_t flags) {
 		sent_pkt.send_time = std::chrono::steady_clock::now();
 		sent_packets.push_back(sent_pkt);
 
+		// 如果发送队列为空，则初始化定时器起点，防止沿用过期的历史时间戳。
+		if (sent_packets.empty())
+			rto_timer_start = sent_pkt.send_time;
+
 		snd_nxt += 1;
 	}
 

@@ -181,7 +181,7 @@ def run_reliable_tests(drop_rate=0.05, delay_ms=10, payload_size=5242880):
             print(
                 "[Orchestrator] Stage 2 (2-5s): 0.1% loss, 10ms delay (Fast Retransmit & Sawtooth)"
             )
-            notify_proxy("SET_DROP_RATE 0.025")
+            notify_proxy("SET_DROP_RATE 0.01")
 
             time.sleep(3.0)
 
