@@ -24,14 +24,13 @@ TcpSocket::TcpSocket()
 	  ssthresh(static_cast<uint32_t>(MAX_RECV_BUF_SIZE)),
 	  dup_ack_count(0),
 	  congestion_state(0),	// 拥塞状态默认为 0（慢启动阶段）。
-	  recover(0),
-	  rto_recover(0),
 	  send_waiting_threads(0),
 	  estimated_rtt(0.1),
 	  dev_rtt(0.05),
 	  rto(0.2),
 	  rto_pending(false),
 	  rto_timer_start(std::chrono::steady_clock::now()),
+	  last_advertised_wnd(static_cast<uint16_t>(MAX_RECV_BUF_SIZE)),
 	  active_event_id(0),
 	  has_ooo_fin(false),
 	  ooo_fin_seq(0),
@@ -291,9 +290,8 @@ int TcpSocket::recv(void* buffer, int len) {
 	// 2. 连接处于数据传递阶段（非挥手收尾状态）。
 	if (read_len > 0 && (state == TcpState::ESTABLISHED || state == TcpState::FIN_WAIT_1 || state == TcpState::FIN_WAIT_2)) {
 		size_t cap = MAX_RECV_BUF_SIZE;
-		// 3. 缓冲区此前接近饱和（before_free < 2 * MSS），说明之前已通告零窗口或极窄窗口，对端正被阻塞。
-		// 4. 释放空间足够显著。
-		if (before_free < 2 * MSS && (after_free - before_free >= MSS || after_free >= cap / 2)) {
+		// 3. 读取后剩余的空闲缓冲区大小增加了至少一个 MSS，或者空闲缓冲区已超过总容量的一半。
+		if (after_free - last_advertised_wnd >= MSS || after_free >= cap / 2) {
 			send_control_packet(TCP_FLAG_ACK);
 			write_log("window_update_sent");
 		}
@@ -375,11 +373,12 @@ void TcpSocket::send_control_packet(uint8_t flags) {
 		sent_pkt.len = 1;
 		sent_pkt.retransmit_count = 0;
 		sent_pkt.send_time = std::chrono::steady_clock::now();
-		sent_packets.push_back(sent_pkt);
 
 		// 如果发送队列为空，则初始化定时器起点，防止沿用过期的历史时间戳。
 		if (sent_packets.empty())
 			rto_timer_start = sent_pkt.send_time;
+
+		sent_packets.push_back(sent_pkt);
 
 		snd_nxt += 1;
 	}
@@ -389,6 +388,19 @@ void TcpSocket::send_control_packet(uint8_t flags) {
 }
 
 uint16_t TcpSocket::get_advertised_window() const {
+	// 统计所有乱序数据占用的物理字节数
+	size_t ooo_bytes = 0;
+	for (size_t i = 0; i < ooo_count; ++i)
+		ooo_bytes += (ooo_intervals[i].second - ooo_intervals[i].first);
+
 	size_t free_space = MAX_RECV_BUF_SIZE - recv_buf.size();
-	return static_cast<uint16_t>(std::min(free_space, static_cast<size_t>(65535)));
+	// 扣除乱序数据占用的空间
+	if (free_space > ooo_bytes)
+		free_space -= ooo_bytes;
+	else
+		free_space = 0;
+
+	uint16_t wnd = static_cast<uint16_t>(std::min(free_space, static_cast<size_t>(65535)));
+	last_advertised_wnd = wnd;
+	return wnd;
 }

@@ -122,12 +122,11 @@ void TcpSocket::handle_timeout() {
 			retransmit_packet(oldest);
 
 			rto = std::min(rto * 2.0, 5.0);
-			if (!rto_pending) {
+			if (!rto_pending)
 				ssthresh = std::max(static_cast<uint32_t>(cwnd / 2), 2 * MSS);
-			}
+
 			cwnd = static_cast<double>(MSS);
-			congestion_state = 0;
-			rto_recover = snd_nxt;
+			congestion_state = 0;  // 回退至慢启动
 			dup_ack_count = 0;
 			rto_pending = true;
 			rto_timer_start = now;

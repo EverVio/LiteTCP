@@ -179,7 +179,7 @@ def run_reliable_tests(drop_rate=0.05, delay_ms=10, payload_size=5242880):
             time.sleep(2.0)
 
             print(
-                "[Orchestrator] Stage 2 (2-5s): 0.1% loss, 10ms delay (Fast Retransmit & Sawtooth)"
+                "[Orchestrator] Stage 2 (2-5s): 1% loss, 10ms delay (Fast Retransmit & Sawtooth)"
             )
             notify_proxy("SET_DROP_RATE 0.01")
 
@@ -191,7 +191,7 @@ def run_reliable_tests(drop_rate=0.05, delay_ms=10, payload_size=5242880):
             time.sleep(0.5)
 
             print("[Orchestrator] Stage 3 Recovery (5.5s+): Restore to 0.1% loss")
-            notify_proxy("SET_DROP_RATE 0.0")
+            notify_proxy("SET_DROP_RATE 0.001")
 
         control_thread = threading.Thread(target=network_controller)
         control_thread.daemon = True
@@ -256,8 +256,8 @@ def main():
     parser.add_argument(
         "--size",
         type=int,
-        default=5242880,
-        help="Payload size in bytes for reliable test (default 5MB)",
+        default=20971520,
+        help="Payload size in bytes for reliable test (default 30MB)",
     )
     args = parser.parse_args()
 

@@ -56,14 +56,12 @@ void run_server(int case_num, size_t payload_size = 5 * 1024 * 1024) {
 
 		auto start = std::chrono::steady_clock::now();
 		size_t last_report = 0;
-		size_t report_interval = 512 * 1024;  // 每接收 512 KB 打印一次实时进度。
+		size_t report_interval = 512 * 1024;
 		bool blocked_7s = false;
+
 		while (received.size() < payload_size) {
-			// 检查是否需要触发 7 秒后的长阻塞（暂停调用 litetcp_recv 2 秒）
-			auto now = std::chrono::steady_clock::now();
-			double elapsed_sec = std::chrono::duration<double>(now - start).count();
-			if (elapsed_sec >= 7.0 && !blocked_7s) {
-				std::cout << "[Server Case 2] Intentionally pause receiving for 2 seconds (Zero Window)..." << std::endl;
+			if (received.size() >= (payload_size / 2) && !blocked_7s) {
+				std::cout << "[Server Case 2] Progress reached 50%. Intentionally pause receiving for 2 seconds (Zero Window)..." << std::endl;
 				std::this_thread::sleep_for(std::chrono::seconds(2));
 				blocked_7s = true;
 			}
